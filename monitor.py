@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 
 BASE = "https://i.tipness.co.jp"
 LOGIN_URL = f"{BASE}/i/auth/login"
-MEMBER_URL = f"{BASE}/i/user/"
+MEMBER_URL = f"{BASE}/i/kf2/"  # 振替予約（会員選択）ページ
 STATE_FILE = Path("state.json")
 DEBUG_FILE = Path("error.html")
 JST = ZoneInfo("Asia/Tokyo")
@@ -218,10 +218,9 @@ def main() -> int:
         soup = BeautifulSoup(r.text, "html.parser")
         url = r.url
 
-        # 会員選択ページ（ログイン後の遷移先に「選択する」が無ければ明示的に移動）
-        if "選択する" not in r.text:
-            r = fetch(s, "GET", MEMBER_URL)
-            soup, url = BeautifulSoup(r.text, "html.parser"), r.url
+        # ログイン後はキッズ会員トップに着地するため、振替予約ページへ明示的に移動
+        r = fetch(s, "GET", MEMBER_URL)
+        soup, url = BeautifulSoup(r.text, "html.parser"), r.url
 
         r, soup, url = follow(s, url, soup, "選択する")
         r, soup, url = follow(s, url, soup, "振替カレンダーへ")
