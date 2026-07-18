@@ -68,59 +68,58 @@ def save_state(state: dict) -> None:
 def login(page) -> None:
     """キッズ保護者用フォームでログインする"""
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-    # ページ内の form のうち「キッズ」の文言を含み、
-    # パスワード入力欄を持つものをキッズ保護者用フォームとみなす
-    kids_form = None
-    forms = page.locator("form")
-    for i in range(forms.count()):
-        f = forms.nth(i)
-        try:
-            text = f.inner_text(timeout=2000)
-        except PWTimeout:
-            continue
-        if "キッズ" in text and f.locator("input[type=password]").count() > 0:
-            kids_form = f
-            break
-
-    if kids_form is None:
-        # 見つからない場合はパスワード欄を持つ最後のフォーム
-        # （ページ構成上、キッズ用は3番目＝最後）
-        candidates = [
-            forms.nth(i)
-            for i in range(forms.count())
-            if forms.nth(i).locator("input[type=password]").count() > 0
-        ]
-        if not candidates:
-            raise RuntimeError("ログインフォームが見つかりませんでした")
-        kids_form = candidates[-1]
-
-    # メールアドレス欄: email型優先、なければpassword以外のtext系入力
-    email_input = kids_form.locator("input[type=email]")
-    if email_input.count() == 0:
-        email_input = kids_form.locator(
-            "input:not([type=password]):not([type=hidden])"
-            ":not([type=checkbox]):not([type=submit]):not([type=button])"
-        )
-    email_input.first.fill(EMAIL)
-    kids_form.locator("input[type=password]").first.fill(PASSWORD)
-
-    # 送信ボタン（「ログイン」ボタン or submit）
-    submit = kids_form.locator(
-        "button[type=submit], input[type=submit], button:has-text('ログイン')"
-    )
-    if submit.count() > 0:
-        submit.first.click()
-    else:
-        kids_form.locator("input[type=password]").first.press("Enter")
-
-    page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(1500)
 
-    # ログイン失敗の検知（ログイン画面に留まっている場合）
+    # このサイトはPC用/スマホ用でログイン欄がHTML内に重複している可能性がある。
+    # そこでDOM順ではなく「画面上の見た目の位置」を使う:
+    # 緑の見出し「キッズ保護者様でログイン」の下にある"表示中の"入力欄・ボタンを
+    # Playwrightのレイアウトセレクタ(:below)で特定し、人間と同じ操作で入力する。
+    A = ":text('キッズ保護者様でログイン')"
+
+    def first_visible(selector: str):
+        loc = page.locator(selector)
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            try:
+                if el.is_visible():
+                    return el
+            except Exception:
+                continue
+        return None
+
+    email_in = (
+        first_visible(f"input[type=text]:below({A})")
+        or first_visible(f"input[type=email]:below({A})")
+    )
+    pw_in = first_visible(f"input[type=password]:below({A})")
+    login_btn = first_visible(f":text-is('ログイン'):below({A})")
+
+    missing = [
+        name for name, el in [
+            ("メール欄", email_in), ("パスワード欄", pw_in), ("ログインボタン", login_btn)
+        ] if el is None
+    ]
+    if missing:
+        raise RuntimeError(f"キッズ保護者欄の要素が見つかりません: {', '.join(missing)}")
+
+    email_in.click()
+    email_in.fill(EMAIL)
+    pw_in.click()
+    pw_in.fill(PASSWORD)
+    login_btn.click()
+
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(2000)
+
+    # ログイン失敗の検知
+    content = page.content()
+    if "パスワードが違います" in content:
+        raise RuntimeError(
+            "サイト側が『ログインID、またはパスワードが違います』と返しました。"
+            "Secretsの値と手動ログインで使った値が完全に一致しているか確認してください。"
+        )
     if "auth/login" in page.url or (
-        page.locator("input[type=password]").count() > 0
-        and "キッズ" in page.content()
+        page.locator("input[type=password]").count() > 0 and "キッズ" in content
     ):
         raise RuntimeError(
             "ログインに失敗した可能性があります。"
