@@ -1,0 +1,52 @@
+name: Tipness振替枠監視
+
+on:
+  schedule:
+    # 10分おき（UTC基準。GitHubの都合で数分遅延することがあります）
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # 手動実行用
+
+concurrency:
+  group: tipness-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # state.json をコミットするため
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存パッケージのインストール
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: 振替枠チェック実行
+        env:
+          TIPNESS_EMAIL: ${{ secrets.TIPNESS_EMAIL }}
+          TIPNESS_PASSWORD: ${{ secrets.TIPNESS_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python monitor.py
+
+      - name: 通知済み状態をコミット
+        if: always()
+        run: |
+          git config user.name "tipness-monitor-bot"
+          git config user.email "actions@github.com"
+          git add state.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "update state [skip ci]"
+          git push || true
+
+      - name: エラー時のスクリーンショットを保存
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot
+          path: error.png
+          if-no-files-found: ignore
