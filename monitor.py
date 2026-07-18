@@ -28,6 +28,7 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 LOGIN_URL = "https://i.tipness.co.jp/i/auth/login"
+MEMBER_SELECT_URL = "https://i.tipness.co.jp/i/user/"  # WEB振替の会員選択ページ
 STATE_FILE = Path("state.json")
 JST = ZoneInfo("Asia/Tokyo")
 TARGET_WEEKDAY = 6  # 月=0 ... 日=6（日曜日を監視）
@@ -114,20 +115,43 @@ def login(page) -> None:
         kids_form.locator("input[type=password]").first.press("Enter")
 
     page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(1500)
+
+    # ログイン失敗の検知（ログイン画面に留まっている場合）
+    if "auth/login" in page.url or (
+        page.locator("input[type=password]").count() > 0
+        and "キッズ" in page.content()
+    ):
+        raise RuntimeError(
+            "ログインに失敗した可能性があります。"
+            "TIPNESS_EMAIL / TIPNESS_PASSWORD のSecretsを確認してください。"
+        )
+
+
+def click_by_text(page, text: str) -> None:
+    """a / button / input いずれのタグでもテキスト一致でクリックする"""
+    loc = page.locator(
+        f"a:has-text('{text}'), button:has-text('{text}'), "
+        f"input[type=submit][value*='{text}'], input[type=button][value*='{text}']"
+    )
+    if loc.count() == 0:
+        loc = page.get_by_text(text, exact=False)
+    loc.first.click()
+    page.wait_for_load_state("domcontentloaded")
 
 
 def goto_calendar(page) -> None:
     """会員選択 →「振替カレンダーへ」→「振替枠確認（通常練習日）」"""
+    # ログイン後の遷移先がWEB振替とは限らないため、会員選択ページへ明示的に移動
+    if "選択する" not in page.content():
+        page.goto(MEMBER_SELECT_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
+
     # 会員選択画面（会員が1人なら最初の「選択する」）
-    select_btn = page.locator("a:has-text('選択する'), button:has-text('選択する')")
-    select_btn.first.click()
-    page.wait_for_load_state("domcontentloaded")
+    click_by_text(page, "選択する")
 
     # 振替カレンダーへ
-    page.locator(
-        "a:has-text('振替カレンダーへ'), button:has-text('振替カレンダーへ')"
-    ).first.click()
-    page.wait_for_load_state("domcontentloaded")
+    click_by_text(page, "振替カレンダーへ")
 
     # 「振替枠確認（通常練習日）」タブを念のためクリック
     tab = page.locator("text=振替枠確認").filter(has_text="通常練習日")
