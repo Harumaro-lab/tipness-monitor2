@@ -23,9 +23,7 @@ jobs:
           python-version: "3.12"
 
       - name: 依存パッケージのインストール
-        run: |
-          pip install playwright requests
-          playwright install --with-deps chromium
+        run: pip install requests beautifulsoup4
 
       - name: 振替枠チェック実行
         env:
@@ -43,10 +41,10 @@ jobs:
           git diff --cached --quiet || git commit -m "update state [skip ci]"
           git push || true
 
-      - name: エラー時のスクリーンショットを保存
+      - name: エラー時のページHTMLを保存
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: error-screenshot
-          path: error.png
+          name: error-page
+          path: error.html
           if-no-files-found: ignore
