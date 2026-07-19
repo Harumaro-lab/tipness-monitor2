@@ -258,4 +258,21 @@ def main() -> int:
     sundays = sorted({d for d in sundays if d >= today})
     print(f"日曜の振替可能日: {[d.isoformat() for d in sundays]}")
 
-    new_slots = [d for d in sundays 
+    new_slots = [d for d in sundays if d.isoformat() not in notified]
+    if new_slots:
+        lines = [f"{d.month}/{d.day}(日)" for d in new_slots]
+        notify(
+            "日曜日に振替枠が出ました: " + "、".join(lines)
+            + f"\n今すぐ予約→ {MEMBER_URL}"
+        )
+        notified.update(d.isoformat() for d in new_slots)
+
+    # 埋まった枠・過去の枠はstateから除去（再度空いたら改めて通知される）
+    current = {d.isoformat() for d in sundays}
+    state["notified"] = sorted(n for n in notified if n in current)
+    save_state(state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
