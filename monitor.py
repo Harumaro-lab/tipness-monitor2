@@ -139,7 +139,14 @@ def follow(s: requests.Session, current_url: str, soup: BeautifulSoup, text: str
                     data[name] = f.get("value", "")
                 continue
             data[name] = f.get("value", "")
-        action = urljoin(current_url, form.get("action") or current_url)
+        # onclick="this.form.action='calendar/';..." 形式で送信先を
+        # 切り替えるボタンに対応
+        action_attr = form.get("action") or ""
+        onclick = inp.get("onclick") or ""
+        m = re.search(r"action\s*=\s*['\"]([^'\"]+)['\"]", onclick)
+        if m:
+            action_attr = m.group(1)
+        action = urljoin(current_url, action_attr or current_url)
         method = (form.get("method") or "get").lower()
         if method == "post":
             r = fetch(s, "POST", action, data=data,
@@ -225,16 +232,22 @@ def main() -> int:
         r, soup, url = follow(s, url, soup, "選択する")
         r, soup, url = follow(s, url, soup, "振替カレンダーへ")
 
-        # カレンダーが無ければ「通常練習日」タブをたどる
-        if find_calendar_table(soup) is None:
-            r, soup, url = follow(s, url, soup, "通常練習日")
+        # カレンダーは「受講予定」タブが初期表示。必ず「振替枠確認（通常練習日）」
+        # タブへ切り替える（受講予定のリンクを空き枠と誤検知しないため）
+        r, soup, url = follow(s, url, soup, "通常練習日")
+        if "振替可能な日程" not in r.text:
+            raise RuntimeError(
+                "『振替枠確認（通常練習日）』タブに切り替わっていません（error.html参照）"
+            )
 
         sundays = parse_sunday_slots(soup)
 
         if CHECK_NEXT_MONTH:
             try:
                 r2, soup2, url2 = follow(s, url, soup, "次月")
-                sundays += parse_sunday_slots(soup2)
+                # 次月ページも振替枠確認ビューであることを確認できた場合のみ採用
+                if "振替可能な日程" in r2.text:
+                    sundays += parse_sunday_slots(soup2)
             except RuntimeError:
                 pass  # 次月リンクが無い月は無視
     except Exception:
@@ -245,21 +258,4 @@ def main() -> int:
     sundays = sorted({d for d in sundays if d >= today})
     print(f"日曜の振替可能日: {[d.isoformat() for d in sundays]}")
 
-    new_slots = [d for d in sundays if d.isoformat() not in notified]
-    if new_slots:
-        lines = [f"{d.month}/{d.day}(日)" for d in new_slots]
-        notify(
-            "日曜日に振替枠が出ました: " + "、".join(lines)
-            + f"\n今すぐ予約→ {MEMBER_URL}"
-        )
-        notified.update(d.isoformat() for d in new_slots)
-
-    # 埋まった枠・過去の枠はstateから除去（再度空いたら改めて通知される）
-    current = {d.isoformat() for d in sundays}
-    state["notified"] = sorted(n for n in notified if n in current)
-    save_state(state)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    new_slots = [d for d in sundays 
