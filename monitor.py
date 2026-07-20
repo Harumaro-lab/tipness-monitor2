@@ -23,8 +23,16 @@ from pathlib import Path
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
+import time
+
 import requests
 from bs4 import BeautifulSoup
+
+# 一時的な通信エラー（リトライ対象）
+NETWORK_ERRORS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+)
 
 BASE = "https://i.tipness.co.jp"
 LOGIN_URL = f"{BASE}/i/auth/login"
@@ -53,7 +61,7 @@ LAST_HTML = ""  # デバッグ用: 最後に受信したHTML
 
 def fetch(session: requests.Session, method: str, url: str, **kw) -> requests.Response:
     global LAST_HTML
-    r = session.request(method, url, timeout=30, **kw)
+    r = session.request(method, url, timeout=60, **kw)
     LAST_HTML = r.text
     return r
 
@@ -215,44 +223,60 @@ def parse_sunday_slots(soup: BeautifulSoup) -> list[datetime.date]:
     return dates
 
 
+def crawl() -> list[datetime.date]:
+    """ログイン〜カレンダー解析までを1回実行して日曜の空き日リストを返す"""
+    s = make_session()
+    r = login(s)
+
+    # ログイン後はキッズ会員トップに着地するため、振替予約ページへ明示的に移動
+    r = fetch(s, "GET", MEMBER_URL)
+    soup, url = BeautifulSoup(r.text, "html.parser"), r.url
+
+    r, soup, url = follow(s, url, soup, "選択する")
+    r, soup, url = follow(s, url, soup, "振替カレンダーへ")
+
+    # カレンダーは「受講予定」タブが初期表示。必ず「振替枠確認（通常練習日）」
+    # タブへ切り替える（受講予定のリンクを空き枠と誤検知しないため）
+    r, soup, url = follow(s, url, soup, "通常練習日")
+    if "振替可能な日程" not in r.text:
+        raise RuntimeError(
+            "『振替枠確認（通常練習日）』タブに切り替わっていません（error.html参照）"
+        )
+
+    sundays = parse_sunday_slots(soup)
+
+    if CHECK_NEXT_MONTH:
+        try:
+            r2, soup2, url2 = follow(s, url, soup, "次月")
+            if "振替可能な日程" in r2.text:
+                sundays += parse_sunday_slots(soup2)
+        except RuntimeError:
+            pass  # 次月リンクが無い月は無視
+    return sundays
+
+
 def main() -> int:
     state = load_state()
     notified = set(state.get("notified", []))
 
-    s = make_session()
-    try:
-        r = login(s)
-        soup = BeautifulSoup(r.text, "html.parser")
-        url = r.url
+    sundays = None
+    for attempt in range(3):
+        try:
+            sundays = crawl()
+            break
+        except NETWORK_ERRORS as e:
+            print(f"通信エラー（試行{attempt + 1}/3）: {e}")
+            if attempt < 2:
+                time.sleep(20)
+        except Exception:
+            DEBUG_FILE.write_text(LAST_HTML, encoding="utf-8")
+            raise
 
-        # ログイン後はキッズ会員トップに着地するため、振替予約ページへ明示的に移動
-        r = fetch(s, "GET", MEMBER_URL)
-        soup, url = BeautifulSoup(r.text, "html.parser"), r.url
-
-        r, soup, url = follow(s, url, soup, "選択する")
-        r, soup, url = follow(s, url, soup, "振替カレンダーへ")
-
-        # カレンダーは「受講予定」タブが初期表示。必ず「振替枠確認（通常練習日）」
-        # タブへ切り替える（受講予定のリンクを空き枠と誤検知しないため）
-        r, soup, url = follow(s, url, soup, "通常練習日")
-        if "振替可能な日程" not in r.text:
-            raise RuntimeError(
-                "『振替枠確認（通常練習日）』タブに切り替わっていません（error.html参照）"
-            )
-
-        sundays = parse_sunday_slots(soup)
-
-        if CHECK_NEXT_MONTH:
-            try:
-                r2, soup2, url2 = follow(s, url, soup, "次月")
-                # 次月ページも振替枠確認ビューであることを確認できた場合のみ採用
-                if "振替可能な日程" in r2.text:
-                    sundays += parse_sunday_slots(soup2)
-            except RuntimeError:
-                pass  # 次月リンクが無い月は無視
-    except Exception:
-        DEBUG_FILE.write_text(LAST_HTML, encoding="utf-8")
-        raise
+    if sundays is None:
+        # サイト側の一時的な不調。10分後の次回実行で再試行されるので
+        # 今回はエラーにせず正常終了する（失敗メールの連発を防ぐ）
+        print("サイトの応答がないため今回はスキップします（次回の実行で再試行）")
+        return 0
 
     today = datetime.datetime.now(JST).date()
     sundays = sorted({d for d in sundays if d >= today})
