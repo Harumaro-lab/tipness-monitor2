@@ -63,11 +63,14 @@ def fetch(session: requests.Session, method: str, url: str, **kw) -> requests.Re
     global LAST_HTML
     r = session.request(method, url, timeout=60, **kw)
     LAST_HTML = r.text
+    if r.status_code == 403 or "セキュリティ機能によりページの表示がブロック" in r.text:
+        raise RuntimeError("Tipness側のセキュリティ機能によりアクセスが拒否されました（403）。空き枠は未確認です。")
+    r.raise_for_status()
     return r
 
 
 def notify(message: str, title: str = "Tipness振替枠") -> None:
-    requests.post(
+    response = requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         headers={
@@ -77,6 +80,7 @@ def notify(message: str, title: str = "Tipness振替枠") -> None:
         },
         timeout=15,
     )
+    response.raise_for_status()
 
 
 def load_state() -> dict:
