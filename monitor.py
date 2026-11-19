@@ -15,6 +15,7 @@ iTIPNESS KIDSスイミング 振替枠監視スクリプト（requests版）
 """
 
 import datetime
+import base64
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
+from email.utils import parsedate_to_datetime
 
 import time
 
@@ -57,16 +59,59 @@ HEADERS = {
 }
 
 LAST_HTML = ""  # デバッグ用: 最後に受信したHTML
+OBSERVED_MONTHS = set()
+STATUS_FILE = Path("status.json")
+
+
+class BlockedError(RuntimeError):
+    pass
+
+
+class TemporaryError(RuntimeError):
+    def __init__(self, message, retry_after=0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class LinkNotFound(RuntimeError):
+    pass
+
+
+def retry_after_seconds(value):
+    if not value:
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        try:
+            return max(0, int((parsedate_to_datetime(value) - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
 
 def fetch(session: requests.Session, method: str, url: str, **kw) -> requests.Response:
     global LAST_HTML
-    r = session.request(method, url, timeout=60, **kw)
-    LAST_HTML = r.text
-    if r.status_code == 403 or "セキュリティ機能によりページの表示がブロック" in r.text:
-        raise RuntimeError("Tipness側のセキュリティ機能によりアクセスが拒否されました（403）。空き枠は未確認です。")
-    r.raise_for_status()
-    return r
+    # Retry read requests only; never repeatedly submit login/forms after refusal.
+    attempts = 3 if method.upper() == "GET" else 1
+    for attempt in range(attempts):
+        try:
+            r = session.request(method, url, timeout=(15, 45), **kw)
+            LAST_HTML = r.text
+            if r.status_code == 403 or "セキュリティ機能によりページの表示がブロック" in r.text:
+                raise BlockedError("Tipness側のアクセス拒否（403）。空き枠は未確認です。")
+            if r.status_code == 429:
+                raise TemporaryError("Tipness側の利用頻度制限（429）。空き枠は未確認です。", retry_after_seconds(r.headers.get("Retry-After")))
+            if r.status_code in (500, 502, 503, 504):
+                raise TemporaryError(f"Tipness側の一時障害（HTTP {r.status_code}）。", retry_after_seconds(r.headers.get("Retry-After")))
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, TemporaryError) as error:
+            # Rate limiting and long server-requested pauses wait until a later run.
+            if (isinstance(error, TemporaryError) and ("429" in str(error) or error.retry_after > 30)) or attempt == attempts - 1:
+                raise
+            delay = max(10 * (attempt + 1), getattr(error, "retry_after", 0))
+            print(f"一時的な通信不調。{delay}秒待って再確認します（{attempt + 1}/{attempts}）。")
+            time.sleep(delay)
 
 
 def notify(message: str, title: str = "Tipness振替枠") -> None:
@@ -74,7 +119,7 @@ def notify(message: str, title: str = "Tipness振替枠") -> None:
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         headers={
-            "Title": title.encode("utf-8"),
+            "Title": "=?UTF-8?B?" + base64.b64encode(title.encode("utf-8")).decode("ascii") + "?=",
             "Priority": "high",
             "Tags": "swimmer",
         },
@@ -90,9 +135,11 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    temporary.replace(STATE_FILE)
 
 
 def make_session() -> requests.Session:
@@ -167,7 +214,7 @@ def follow(s: requests.Session, current_url: str, soup: BeautifulSoup, text: str
             r = fetch(s, "GET", action, params=data,
                       headers={"Referer": current_url})
         return r, BeautifulSoup(r.text, "html.parser"), r.url
-    raise RuntimeError(f"『{text}』のリンク/ボタンが見つかりません（error.html参照）")
+    raise LinkNotFound(f"『{text}』のリンク/ボタンが見つかりません")
 
 
 WEEKDAY_HEADERS = ["月", "火", "水", "木", "金", "土", "日"]
@@ -193,7 +240,15 @@ def parse_sunday_slots(soup: BeautifulSoup) -> list[datetime.date]:
         raise RuntimeError("カレンダーの月を特定できません")
     month = int(m.group(1))
     now = datetime.datetime.now(JST)
-    year = now.year + (1 if month < now.month - 1 else 0)
+    explicit_year = re.search(r"(20\d{2})\s*年", table.get_text())
+    if explicit_year:
+        year = int(explicit_year.group(1))
+    elif month == now.month:
+        year = now.year
+    elif month == now.month % 12 + 1:
+        year = now.year + (1 if now.month == 12 else 0)
+    else:
+        raise RuntimeError("想定外のカレンダー月です。空き枠として扱いません。")
 
     rows = table.find_all("tr")
     # 曜日ヘッダー行から「日」列の位置を特定
@@ -224,6 +279,7 @@ def parse_sunday_slots(soup: BeautifulSoup) -> list[datetime.date]:
                     dates.append(datetime.date(year, month, int(day_text)))
                 except ValueError:
                     pass
+    OBSERVED_MONTHS.add((year, month))
     return dates
 
 
@@ -254,52 +310,103 @@ def crawl() -> list[datetime.date]:
             r2, soup2, url2 = follow(s, url, soup, "次月")
             if "振替可能な日程" in r2.text:
                 sundays += parse_sunday_slots(soup2)
-        except RuntimeError:
+            else:
+                raise RuntimeError("翌月カレンダーを確認できませんでした。")
+        except LinkNotFound:
             pass  # 次月リンクが無い月は無視
     return sundays
 
 
+def write_status(state, status, message, now, **extra):
+    health = state.setdefault("health", {})
+    report = {
+        "checked_at": now.isoformat(), "status": status, "message": message,
+        "last_success": health.get("last_success"),
+        "next_check_after": health.get("next_check_after"), **extra,
+    }
+    temp = STATUS_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(STATUS_FILE)
+    print(json.dumps(report, ensure_ascii=False))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write("\n### Tipness監視結果\n\n")
+            handle.write(f"状態: **{status}** — {message}\n\n")
+            handle.write(f"最終確認成功: {report['last_success'] or '未記録'}\n\n")
+            if report["next_check_after"]:
+                handle.write(f"再確認可能時刻: {report['next_check_after']}\n")
+    return report
+
+
 def main() -> int:
+    now = datetime.datetime.now(JST)
     state = load_state()
-    notified = set(state.get("notified", []))
-
-    sundays = None
-    for attempt in range(3):
-        try:
-            sundays = crawl()
-            break
-        except NETWORK_ERRORS as e:
-            print(f"通信エラー（試行{attempt + 1}/3）: {e}")
-            if attempt < 2:
-                time.sleep(20)
-        except Exception:
-            DEBUG_FILE.write_text(LAST_HTML, encoding="utf-8")
-            raise
-
-    if sundays is None:
-        # サイト側の一時的な不調。10分後の次回実行で再試行されるので
-        # 今回はエラーにせず正常終了する（失敗メールの連発を防ぐ）
-        print("サイトの応答がないため今回はスキップします（次回の実行で再試行）")
+    health = state.setdefault("health", {})
+    # This scheduled pause does not count as an availability check.
+    if (now.hour == 23 and now.minute >= 45) or (now.hour == 0 and now.minute < 15):
+        write_status(state, "scheduled_pause", "WEB振替のメンテナンス時間（23:45〜0:15）。今回は未確認です。", now)
+        return 0
+    next_check = health.get("next_check_after")
+    if next_check and now < datetime.datetime.fromisoformat(next_check):
+        write_status(state, "deferred", "前回の拒否・一時障害を受け、間隔を空けています。今回は未確認です。", now)
         return 0
 
-    today = datetime.datetime.now(JST).date()
-    sundays = sorted({d for d in sundays if d >= today})
-    print(f"日曜の振替可能日: {[d.isoformat() for d in sundays]}")
-
-    new_slots = [d for d in sundays if d.isoformat() not in notified]
-    if new_slots:
-        lines = [f"{d.month}/{d.day}(日)" for d in new_slots]
-        notify(
-            "日曜日に振替枠が出ました: " + "、".join(lines)
-            + f"\n今すぐ予約→ {MEMBER_URL}"
+    OBSERVED_MONTHS.clear()
+    try:
+        sundays = crawl()
+        today = now.date()
+        sundays = sorted({d for d in sundays if d >= today})
+        print(f"日曜の振替可能日: {[d.isoformat() for d in sundays]}")
+        notified = set(state.get("notified", []))
+        new_slots = [d for d in sundays if d.isoformat() not in notified]
+        if new_slots:
+            lines = [f"{d.month}/{d.day}(日)" for d in new_slots]
+            notify("日曜日に振替枠が出ました: " + "、".join(lines) + f"\n今すぐ予約→ {MEMBER_URL}")
+            notified.update(d.isoformat() for d in new_slots)
+        current = {d.isoformat() for d in sundays}
+        # Preserve records for months that were not observed (e.g. no next-month link).
+        state["notified"] = sorted(
+            n for n in notified
+            if datetime.date.fromisoformat(n) >= today
+            and (n in current or (datetime.date.fromisoformat(n).year, datetime.date.fromisoformat(n).month) not in OBSERVED_MONTHS)
         )
-        notified.update(d.isoformat() for d in new_slots)
-
-    # 埋まった枠・過去の枠はstateから除去（再度空いたら改めて通知される）
-    current = {d.isoformat() for d in sundays}
-    state["notified"] = sorted(n for n in notified if n in current)
-    save_state(state)
-    return 0
+        state["health"] = {"last_success": now.isoformat(), "consecutive_failures": 0}
+        save_state(state)
+        write_status(state, "ok", "カレンダーの確認と必要な通知処理が完了しました。", now, slot_count=len(sundays))
+        return 0
+    except Exception as error:
+        # Do not persist exception URLs: notification URLs can contain the secret topic.
+        if isinstance(error, BlockedError):
+            category, message = "blocked", "Tipnessがアクセスを拒否しました（403）。空き枠は未確認です。"
+        elif isinstance(error, TemporaryError):
+            category, message = "temporary", str(error)
+        elif isinstance(error, NETWORK_ERRORS):
+            category, message = "network", "通信失敗。空き枠または通知送信の完了を確認できませんでした。"
+        elif isinstance(error, requests.exceptions.HTTPError):
+            code = error.response.status_code if error.response is not None else "unknown"
+            category, message = "http_error", f"HTTP {code}。処理を完了できませんでした。"
+        elif isinstance(error, RuntimeError):
+            category, message = "page_error", str(error)
+        else:
+            category, message = "error", f"処理失敗（{type(error).__name__}）。確認が必要です。"
+        failures = health.get("consecutive_failures", 0) + 1
+        health.update(consecutive_failures=failures, last_failure=now.isoformat(), category=category)
+        # 403 is never retried immediately. Give the service a progressively longer rest.
+        if category == "blocked":
+            pause = min(6 * 3600, 3600 * 2 ** min(failures - 1, 3))
+            health["next_check_after"] = (now + datetime.timedelta(seconds=pause)).isoformat()
+        elif category == "temporary":
+            pause = max(600, getattr(error, "retry_after", 0))
+            health["next_check_after"] = (now + datetime.timedelta(seconds=pause)).isoformat()
+        else:
+            health.pop("next_check_after", None)
+        # Notification failure must never advance the notified list.
+        save_state(state)
+        write_status(state, category, message, now)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error::{message}")
+        return 1
 
 
 if __name__ == "__main__":
