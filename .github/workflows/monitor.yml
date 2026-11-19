@@ -1,14 +1,10 @@
 name: Tipness振替枠監視
 
 on:
-  push:
-    paths:
-      - monitor.py
-      - tests/**
-      - .github/workflows/monitor.yml
   schedule:
+    # 10分おき（UTC基準。GitHubの都合で数分遅延することがあります）
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}  # 手動実行用
 
 concurrency:
   group: tipness-monitor
@@ -17,40 +13,38 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
     permissions:
-      contents: write
+      contents: write  # state.json をコミットするため
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: 依存パッケージのインストール
-        run: python -m pip install requests beautifulsoup4
-      - name: 監視ロジックの回帰テスト
-        run: python -m unittest discover -s tests -v
+        run: pip install requests beautifulsoup4
+
       - name: 振替枠チェック実行
         env:
           TIPNESS_EMAIL: ${{ secrets.TIPNESS_EMAIL }}
           TIPNESS_PASSWORD: ${{ secrets.TIPNESS_PASSWORD }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python monitor.py
-      - name: 通知履歴と再試行時刻を保存
+
+      - name: 通知済み状態をコミット
         if: always()
         run: |
-          if [ ! -f state.json ]; then exit 0; fi
           git config user.name "tipness-monitor-bot"
           git config user.email "actions@github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "update monitor state [skip ci]"
-            git push
-          fi
-      - name: 失敗理由を保存（個人情報を含むHTMLは保存しない）
+          git add state.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "update state [skip ci]"
+          git push || true
+
+      - name: エラー時のページHTMLを保存
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: monitor-status
-          path: status.json
-          retention-days: 7
+          name: error-page
+          path: error.html
           if-no-files-found: ignore

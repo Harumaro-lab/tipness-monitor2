@@ -1,11 +1,5 @@
 {
   "notified": [
     "2026-10-11"
-  ],
-  "health": {
-    "consecutive_failures": 1,
-    "last_failure": "2026-11-19T22:25:25.278130+09:00",
-    "category": "blocked",
-    "next_check_after": "2026-11-19T23:25:25.278130+09:00"
-  }
+  ]
 }
