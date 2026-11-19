@@ -29,6 +29,9 @@ class FixedNow(datetime.datetime):
 
 class MonitorTests(unittest.TestCase):
     def setUp(self):
+        p = patch.dict(os.environ, {'GITHUB_ACTIONS': 'false', 'GITHUB_STEP_SUMMARY': ''})
+        p.start()
+        self.addCleanup(p.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         for name, filename in [('STATE_FILE', 'state.json'), ('STATUS_FILE', 'status.json')]:
