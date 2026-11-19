@@ -24,7 +24,8 @@ jobs:
           NTFY_TOPIC: diagnostic-unused
           PYTHONIOENCODING: utf-8
         run: |
-          import json, os
+          import json, os, sys
+          sys.path.insert(0, os.environ["GITHUB_WORKSPACE"])
           import requests
           import monitor
           result = {"runner": "windows-2022"}
