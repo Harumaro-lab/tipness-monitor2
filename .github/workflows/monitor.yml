@@ -1,6 +1,11 @@
 name: Tipness振替枠監視
 
 on:
+  push:
+    paths:
+      - monitor.py
+      - tests/**
+      - .github/workflows/monitor.yml
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch: {}
