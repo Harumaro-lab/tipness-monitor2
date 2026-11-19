@@ -1,0 +1,42 @@
+name: Tipness Windows connectivity check
+on:
+  push:
+    paths:
+      - .github/workflows/windows-connectivity.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: windows-2022
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install requests beautifulsoup4 tzdata
+      - name: Check public login page once without credentials
+        shell: python
+        env:
+          TIPNESS_EMAIL: diagnostic-unused
+          TIPNESS_PASSWORD: diagnostic-unused
+          NTFY_TOPIC: diagnostic-unused
+          PYTHONIOENCODING: utf-8
+        run: |
+          import json, os
+          import requests
+          import monitor
+          result = {"runner": "windows-2022"}
+          try:
+              with monitor.make_session() as session:
+                  r = session.get(monitor.LOGIN_URL, timeout=(15, 30))
+                  result.update(http=r.status_code,
+                      login_form='name="login_pass"' in r.text,
+                      security_block="セキュリティ機能によりページの表示がブロック" in r.text)
+          except requests.RequestException as error:
+              result["error_type"] = type(error).__name__
+          print(json.dumps(result, ensure_ascii=False))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("## Public login check (no credentials submitted)\n\n")
+              f.write("```json\n" + json.dumps(result, ensure_ascii=False, indent=2) + "\n```\n")
